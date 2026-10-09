@@ -1,4 +1,5 @@
 import csv
+import datetime as dt
 import io
 import json
 from pathlib import Path
@@ -7,7 +8,7 @@ from fastapi import Body, FastAPI, HTTPException, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
-from . import cache, db
+from . import cache, db, schedule
 from .allocate import (
     BATCH_SIZE, AllocationError, assign_individual, into_batches, parse_csv, summarise,
 )
@@ -208,17 +209,149 @@ def export_csv(run_id: int):
     buf = io.StringIO()
     w = csv.writer(buf)
     w.writerow(["Position", "Name", "USN", "Project #", "Project", "Set",
-                "Language", "Starter repo", "Revealed"])
+                "Language", "Fork this repo", "Revealed"])
     for r in rows:
         p = by_id.get(r["project_id"], {})
         w.writerow([r["position"], r["name"], r["usn"] or "", r["project_id"],
                     r["project_title"], p.get("set", ""), p.get("language", ""),
-                    "yes" if p.get("starter") else "no",
+                    p.get("repo", ""),
                     "yes" if r["revealed"] else "no"])
     buf.seek(0)
     return StreamingResponse(
         iter([buf.getvalue()]), media_type="text/csv",
         headers={"Content-Disposition": f'attachment; filename="assignments-run-{run_id}.csv"'})
+
+
+# ---------------------------- schedules ---------------------------
+# One 10-minute evening slot per student. See app/schedule.py for the rules.
+SCHEDULE_INDEX = "schedules:index"
+
+
+def _schedule_key(schedule_id):
+    return f"schedule:{schedule_id}"
+
+
+def _render_schedule(schedule_id):
+    """The whole schedule as plain JSON-safe data, or None if there isn't one."""
+    meta = db.one("SELECT id, cohort_id, seed, start_date FROM schedules WHERE id = %s",
+                  (schedule_id,))
+    if not meta:
+        return None
+    rows = db.query(
+        "SELECT m.slot_at, s.name, s.usn FROM meeting_slots m"
+        " JOIN students s ON s.id = m.student_id"
+        " WHERE m.schedule_id = %s ORDER BY m.slot_at", (schedule_id,))
+
+    slots = [{"position": i, "name": r["name"], "usn": r["usn"] or "",
+              **schedule.slot_fields(r["slot_at"])}
+             for i, r in enumerate(rows, start=1)]
+    days = sorted({s["date"] for s in slots})
+    return {
+        "schedule": {**meta, "start_date": meta["start_date"].isoformat()},
+        "days": days,
+        "per_day": {d: sum(1 for s in slots if s["date"] == d) for d in days},
+        "slots": slots,
+        "total": len(slots),
+    }
+
+
+@app.post("/api/schedules", status_code=201)
+def create_schedule(payload: dict = Body(...)):
+    """Book the whole cohort: 5 evenings x 12 slots, Friday skipped."""
+    cohort_id = payload.get("cohort_id")
+    seed = int(payload.get("seed", 42))
+    raw_start = str(payload.get("start_date", "")).strip()
+    try:
+        start = dt.date.fromisoformat(raw_start) if raw_start else dt.date.today()
+    except ValueError:
+        raise HTTPException(400, f"start_date {raw_start!r} is not a date like 2026-10-12")
+
+    students = db.query("SELECT id, name, usn FROM students WHERE cohort_id = %s ORDER BY id",
+                        (cohort_id,))
+    if not students:
+        raise HTTPException(404, "no such cohort, or it has no students")
+
+    try:
+        days = schedule.teaching_days(start)
+        slots = schedule.build_slots(days)
+        booked = schedule.assign_slots([dict(s) for s in students], slots, seed)
+    except schedule.ScheduleError as exc:
+        raise HTTPException(400, str(exc))
+
+    # One transaction: a failed slot insert must not leave an empty schedule behind.
+    with db.connect() as conn, conn.cursor() as cur:
+        cur.execute("INSERT INTO schedules (cohort_id, seed, start_date)"
+                    " VALUES (%s,%s,%s) RETURNING id", (cohort_id, seed, start))
+        schedule_id = cur.fetchone()["id"]
+        for b in booked:
+            cur.execute("INSERT INTO meeting_slots (schedule_id, student_id, slot_at)"
+                        " VALUES (%s,%s,%s)", (schedule_id, b["student"]["id"], b["slot"]))
+
+    cache.drop(SCHEDULE_INDEX)
+    cache.drop(_schedule_key(schedule_id))
+    return {"schedule_id": schedule_id, "cohort_id": cohort_id, "seed": seed,
+            "start_date": start.isoformat(), "days": [d.isoformat() for d in days],
+            "capacity": len(slots), "booked": len(booked),
+            "spare_slots": len(slots) - len(booked)}
+
+
+@app.get("/api/schedules")
+def list_schedules():
+    hit = cache.get_json(SCHEDULE_INDEX)
+    if hit:
+        return {"schedules": hit, "cached": True}
+    rows = db.query(
+        "SELECT sc.id, sc.cohort_id, c.label, sc.seed, sc.start_date, sc.created_at,"
+        " (SELECT count(*) FROM meeting_slots m WHERE m.schedule_id = sc.id) AS slots"
+        " FROM schedules sc JOIN cohorts c ON c.id = sc.cohort_id ORDER BY sc.id DESC")
+    out = [{**dict(r), "start_date": r["start_date"].isoformat(),
+            "created_at": r["created_at"].isoformat()} for r in rows]
+    cache.set_json(SCHEDULE_INDEX, out, ttl=3600)
+    return {"schedules": out, "cached": False}
+
+
+@app.get("/api/schedules/{schedule_id}")
+def get_schedule(schedule_id: int):
+    """Every student with their day and time."""
+    hit = cache.get_json(_schedule_key(schedule_id))
+    if hit:
+        return {**hit, "cached": True}
+    out = _render_schedule(schedule_id)
+    if not out:
+        raise HTTPException(404, "no such schedule")
+    cache.set_json(_schedule_key(schedule_id), out, ttl=3600)
+    return {**out, "cached": False}
+
+
+@app.get("/api/schedules/{schedule_id}/export.csv")
+def export_schedule_csv(schedule_id: int):
+    """A real CSV download, for pinning to the notice board."""
+    meta = db.one("SELECT id, cohort_id FROM schedules WHERE id = %s", (schedule_id,))
+    if not meta:
+        raise HTTPException(404, "no such schedule")
+
+    # Project columns come from the latest run for this cohort, if there is one.
+    rows = db.query(
+        "SELECT s.name, s.usn, m.slot_at, a.project_id, a.project_title"
+        " FROM meeting_slots m"
+        " JOIN students s ON s.id = m.student_id"
+        " LEFT JOIN assignments a ON a.student_id = m.student_id AND a.run_id ="
+        "   (SELECT max(r.id) FROM runs r WHERE r.cohort_id = %s)"
+        " WHERE m.schedule_id = %s ORDER BY m.slot_at", (meta["cohort_id"], schedule_id))
+
+    by_id = {p["id"]: p for p in PROJECTS}
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(["Name", "USN", "Day", "Date", "Time", "Project", "Fork this repo"])
+    for r in rows:
+        f = schedule.slot_fields(r["slot_at"])
+        p = by_id.get(r["project_id"], {})
+        w.writerow([r["name"], r["usn"] or "", f["day"], f["date"], f["time"],
+                    r["project_title"] or "", p.get("repo", "")])
+    buf.seek(0)
+    return StreamingResponse(
+        iter([buf.getvalue()]), media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="schedule-{schedule_id}.csv"'})
 
 
 STATIC = HERE / "static"

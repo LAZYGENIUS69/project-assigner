@@ -68,3 +68,48 @@ That is the file worth unit testing, and the cases that matter are:
   rather than forming a group of one
 - the same seed always produces the same allocation
 - more groups than projects wraps round evenly instead of running out
+
+## Meeting slots (the viva schedule)
+
+Each student gets **one 10-minute slot**, evenings only.
+
+| Rule | Value |
+|---|---|
+| Window | 18:00 to 20:00 — 12 slots a day |
+| First / last slot | starts 18:00 / starts 19:50 and **ends** 20:00. There is no 20:00 slot |
+| Days | the next Mon, Tue, Wed, Thu and **Sat** |
+| Friday | **holiday — always skipped.** Sunday is never used |
+| Capacity | 5 days x 12 = 60 slots, exactly one cohort, zero spare |
+| Order | shuffled by `seed`, so the same seed always gives the same schedule |
+
+More students than slots is refused with the shortfall named
+(`61 students but only 60 slots - add another day`). Fewer students just
+leaves the late slots empty. The start date is *inclusive*: starting on a
+Saturday puts the first viva that Saturday, starting on a Friday or a
+Sunday moves it to the next teaching day.
+
+### Endpoints
+
+| Method | Path | Does |
+|---|---|---|
+| `POST` | `/api/schedules` | `{"cohort_id":2,"seed":42,"start_date":"2026-10-12"}` — books the whole cohort |
+| `GET` | `/api/schedules` | list them |
+| `GET` | `/api/schedules/{id}` | every student with their day and time |
+| `GET` | `/api/schedules/{id}/export.csv` | CSV download: Name, USN, Day, Date, Time, Project, Fork this repo |
+
+The CSV joins each student to their project from the **latest run** for that
+cohort; the Project and repo columns are blank if the cohort has never been
+run. Rendered schedules are cached in Redis and the cache is dropped when a
+new schedule is created.
+
+The database enforces the two rules that matter: `UNIQUE(schedule_id,
+student_id)` so nobody is booked twice, and `UNIQUE(schedule_id, slot_at)`
+so two students are never given the same slot.
+
+### Where the logic lives
+
+`app/schedule.py` is **pure** — no database, no HTTP. That is the file worth
+unit testing, and the cases that matter are listed in its docstring: starting
+on a Friday, a Saturday or a Sunday; the window dividing into exactly 12
+slots with the last ending at 20:00; more students than slots; and the same
+seed reproducing the same schedule.
