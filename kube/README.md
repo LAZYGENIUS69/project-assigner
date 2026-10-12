@@ -136,75 +136,70 @@ selector back and it returns.
 
 ## Testing it from inside the cluster
 
-`pod-test.yaml` is that same check, written down so you do not have to remember
-it. It runs four checks from inside the Pod network and then stops.
+`pod-test.yaml` is a throwaway busybox that sleeps for an hour. It does nothing
+by itself — it is somewhere to stand.
 
 ```bash
-kubectl delete pod pod-test --ignore-not-found
 kubectl apply -f pod-test.yaml
-kubectl get pod pod-test
+kubectl exec -it pod-test -- sh
 ```
 
-The STATUS column is the verdict:
+From inside:
 
-| STATUS | Meaning |
-|---|---|
-| `Completed` | every check passed |
-| `Error` | at least one failed — read the logs |
-
-```bash
-kubectl logs pod-test
+```sh
+wget -qO- http://project-assigner/api/health   # port 80, the Service port
+nc -z -w3 db 5432    && echo db ok
+nc -z -w3 cache 6379 && echo cache ok
 ```
 
 ```
---- can this Pod reach the other Services? ---
-PASS  db      tcp 5432
-PASS  cache   tcp 6379
---- is the app actually serving? ---
-      /api/health -> {"status":"ok","postgres":true,"redis":true}
-PASS  app can reach postgres
-PASS  app can reach redis
----
-all checks passed
+{"status":"ok","postgres":true,"redis":true}
+db ok
+cache ok
 ```
 
-**Always delete before you apply.** Running `kubectl apply` on a Pod that has
-already finished prints `unchanged` and runs nothing. The Pod you are reading
-the logs of is the old one. This catches everybody once.
+That one `wget` covers a lot at once: cluster DNS resolved the name, the
+Service's selector matched some Pods, one of them answered, and it could reach
+both Postgres and Redis.
 
-This is the loud version of the silent failure above. Break the selector again
-and re-run it:
+Note the port is **80**, not 8080. 80 is the Service port; 8080 is the port the
+container listens on. `04-service.yml` maps one to the other.
+
+Why from in here rather than curl on your laptop? Because `project-assigner` is
+a name that only exists inside the cluster. A port-forward to `localhost:8090`
+skips both cluster DNS and the Service IP, so it can work perfectly while the
+route your other Pods actually use is broken.
+
+Which is worth seeing. Break the selector and try again from the same shell:
 
 ```bash
 kubectl patch svc project-assigner -p '{"spec":{"selector":{"app":"typo"}}}'
-kubectl delete pod pod-test --ignore-not-found && kubectl apply -f pod-test.yaml
-kubectl logs pod-test
 ```
 
-```
-PASS  db      tcp 5432
-PASS  cache   tcp 6379
-      /api/health -> <no response>
-FAIL  app can reach postgres
-FAIL  app can reach redis
+```sh
+wget -qO- -T5 http://project-assigner/api/health   # hangs, then nothing
+nc -z -w3 db 5432    && echo db ok                 # still ok
+nc -z -w3 cache 6379 && echo cache ok              # still ok
 ```
 
-Read that carefully: db and cache still **pass**. Only the route through the
-Service fails. That is how you tell "the database is down" apart from "the
-Service is not pointing at anything" — a distinction `kubectl get pods` cannot
-make for you, because every Pod says `Running` in both cases.
+db and cache still answer. Only the route through the Service is gone. That is
+how you tell "the database is down" apart from "the Service is not pointing at
+anything" — a distinction `kubectl get pods` cannot make for you, because every
+Pod says `Running` in both cases.
 
-Put it back when you are done:
+Put it back:
 
 ```bash
 kubectl patch svc project-assigner -p '{"spec":{"selector":{"app":"project-assigner"}}}'
 kubectl get endpoints project-assigner    # three IPs again
 ```
 
-Why run the checks in a Pod rather than curl from your laptop? Because
-`http://project-assigner` only means anything inside the cluster. A
-port-forward to `localhost:8090` bypasses cluster DNS and the Service IP, so it
-can succeed while the thing your other Pods actually use is broken.
+Delete the test Pod when you are done — it is not part of the app, and it is
+labelled `app=pod-test` precisely so the Service never adopts it as a backend:
+
+```bash
+kubectl delete pod pod-test
+```
 
 ## Stop it
 

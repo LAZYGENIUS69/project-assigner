@@ -1,16 +1,23 @@
-# A Pod that tests the cluster from the inside, and then stops.
+# A throwaway shell inside the cluster. It does nothing on its own - it just
+# stays up for an hour so you can exec into it and poke at things.
 #
-#   kubectl delete pod pod-test --ignore-not-found
 #   kubectl apply -f pod-test.yaml
-#   kubectl get pod pod-test        # Completed = everything passed, Error = something failed
-#   kubectl logs pod-test           # which check failed
+#   kubectl exec -it pod-test -- sh
 #
-# Re-applying a finished Pod does nothing - kubectl just says "unchanged".
-# Delete it first, every time. That is what the first line above is for.
+# Then, from inside:
 #
-# Why run the checks from in here instead of from your laptop? Because this is
-# the only place the Service name, the ClusterIP and the Pod network exist.
-# `curl localhost:8090` through a port-forward skips all three.
+#   wget -qO- http://project-assigner/api/health   # port 80, the Service port
+#   nc -z -w3 db 5432    && echo db ok
+#   nc -z -w3 cache 6379 && echo cache ok
+#
+# Why in here and not from your laptop? Because `project-assigner` is a name
+# that only exists inside the cluster. A port-forward to localhost skips both
+# cluster DNS and the Service, so it can work while the route your other Pods
+# actually use is broken.
+#
+# Delete it when you are done - it is not part of the app:
+#
+#   kubectl delete pod pod-test
 apiVersion: v1
 kind: Pod
 metadata:
@@ -21,7 +28,6 @@ metadata:
     # traffic to a busybox that is not listening on 8080.
     app: pod-test
 spec:
-  # Never restart. A test that reruns itself forever cannot report a verdict.
   restartPolicy: Never
   containers:
     - name: test
@@ -29,43 +35,4 @@ spec:
       imagePullPolicy: IfNotPresent
       command: ["sh", "-c"]
       args:
-        - |
-          fails=0
-          check() {
-            # $1 is a label, the rest is the command to run
-            label=$1; shift
-            if "$@" >/dev/null 2>&1; then
-              echo "PASS  $label"
-            else
-              echo "FAIL  $label"
-              fails=$((fails + 1))
-            fi
-          }
-
-          echo "--- can this Pod reach the other Services? ---"
-          check "db      tcp 5432"  nc -z -w3 db 5432
-          check "cache   tcp 6379"  nc -z -w3 cache 6379
-
-          echo "--- is the app actually serving? ---"
-          # Port 80 is the Service port, not the container's 8080. Going
-          # through the Service is the point: it proves DNS resolved, the
-          # selector matched some Pods, and one of them answered.
-          body=$(wget -qO- -T5 http://project-assigner/api/health 2>/dev/null)
-          echo "      /api/health -> ${body:-<no response>}"
-
-          case "$body" in
-            *'"postgres":true'*) echo "PASS  app can reach postgres" ;;
-            *) echo "FAIL  app can reach postgres"; fails=$((fails + 1)) ;;
-          esac
-          case "$body" in
-            *'"redis":true'*) echo "PASS  app can reach redis" ;;
-            *) echo "FAIL  app can reach redis"; fails=$((fails + 1)) ;;
-          esac
-
-          echo "---"
-          if [ "$fails" -eq 0 ]; then
-            echo "all checks passed"
-            exit 0
-          fi
-          echo "$fails check(s) failed"
-          exit 1
+        - sleep 3600
