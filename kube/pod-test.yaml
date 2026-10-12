@@ -1,37 +1,14 @@
-# A throwaway shell inside the cluster. It does nothing on its own - it just
-# stays up for an hour so you can exec into it and poke at things.
-#
-#   kubectl apply -f pod-test.yaml
-#   kubectl exec -it pod-test -- sh
-#
-# Then, from inside:
-#
-#   wget -qO- http://project-assigner/api/health   # port 80, the Service port
-#   nc -z -w3 db 5432    && echo db ok
-#   nc -z -w3 cache 6379 && echo cache ok
-#
-# Why in here and not from your laptop? Because `project-assigner` is a name
-# that only exists inside the cluster. A port-forward to localhost skips both
-# cluster DNS and the Service, so it can work while the route your other Pods
-# actually use is broken.
-#
-# Delete it when you are done - it is not part of the app:
-#
-#   kubectl delete pod pod-test
 apiVersion: v1
 kind: Pod
 metadata:
   name: pod-test
   labels:
-    # NOT app=project-assigner. This Pod has no readinessProbe, so it would be
-    # Ready the instant it starts and the Service would begin sending real
-    # traffic to a busybox that is not listening on 8080.
     app: pod-test
 spec:
   restartPolicy: Never
   containers:
     - name: test
-      image: busybox:1.36
+      image: busybox:1.35
       imagePullPolicy: IfNotPresent
       command: ["sh", "-c"]
       args:
