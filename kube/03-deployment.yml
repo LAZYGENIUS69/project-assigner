@@ -17,13 +17,17 @@ spec:
       labels:
         app: project-assigner
     spec:
+      # Docker Hub login for pulling the image. The Secret is namespaced, so
+      # it must exist in every namespace this Deployment is applied to.
+      imagePullSecrets:
+        - name: regcred
       containers:
         - name: web
-          image: project-assigner:k8s
-          # The image was loaded into minikube by hand, so never go to a
-          # registry looking for it. Without this line a :latest tag would be
-          # re-pulled and the Pod would sit in ImagePullBackOff.
-          imagePullPolicy: IfNotPresent
+          image: hangrysingh/project-assigner:prod
+          # :prod is a moving tag - the same name points at a new image on
+          # every pipeline run. Always means re-check the registry each time,
+          # instead of serving whatever the node happens to have cached.
+          imagePullPolicy: Always
           ports:
             - containerPort: 8080
           env:
@@ -39,3 +43,5 @@ spec:
               port: 8080
             initialDelaySeconds: 3
             periodSeconds: 5
+## To create ur regisry connections 
+##kubectl create secret docker-registry regcred --docker-server=https://index.docker.io/v2/ --docker-username=<> --docker-password=<> --docker-email=<your-email> -n <your-namespace>

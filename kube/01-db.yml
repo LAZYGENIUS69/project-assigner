@@ -6,7 +6,7 @@ kind: Deployment
 metadata:
   name: db
 spec:
-  replicas: 1
+  replicas: 2
   selector:
     matchLabels:
       app: db
@@ -48,16 +48,3 @@ spec:
         - name: pgdata
           emptyDir: {}
 ---
-# Called "db" on purpose: the app's DATABASE_URL then reads
-# postgres://assigner:assigner@db:5432/assigner - character for character the
-# same string that docker-compose.yml uses.
-apiVersion: v1
-kind: Service
-metadata:
-  name: db
-spec:
-  selector:
-    app: db
-  ports:
-    - port: 5432
-      targetPort: 5432

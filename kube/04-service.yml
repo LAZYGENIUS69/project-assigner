@@ -15,4 +15,15 @@ spec:
   ports:
     - port: 80          # the port the Service answers on, inside the cluster
       targetPort: 8080  # the port the container actually listens on
-      nodePort: 30080   # the port opened on the node itself
+      nodePort: 30202  # the port opened on the node itself
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: db
+spec:
+  selector:
+    app: db
+  ports:
+    - port: 5432
+      targetPort: 5432

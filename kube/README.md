@@ -26,7 +26,7 @@ docker build -t project-assigner:k8s .
 minikube image load project-assigner:k8s
 minikube image load postgres:16-alpine
 minikube image load redis:7-alpine
-minikube image load busybox:1.36                 # only for pod-test.yaml
+minikube image load busybox:1.35                 # only for pod-test.yaml
 
 minikube image ls | grep -E "project-assigner|postgres|redis|busybox"   # all four listed
 ```
@@ -38,6 +38,46 @@ looking for the image online and land in `ImagePullBackOff`.
 > Do **not** use `eval $(minikube docker-env)`. It silently repoints `docker`
 > at the cluster's daemon, and any `docker compose` you run in that terminal
 > afterwards will not find your real stack.
+
+## Docker Hub pull credentials
+
+The Deployment pulls `hangrysingh/project-assigner:prod` from Docker Hub, so
+every namespace it runs in needs a `regcred` Secret. Secrets are namespaced —
+creating it once does **not** cover the others.
+
+```bash
+read -rp  "Docker Hub username: " DOCKERHUB_USER
+read -rsp "Docker Hub access token: " DOCKERHUB_TOKEN; echo
+
+for ns in default qa-project-assigner staging-project-assigner production-project-assigner; do
+  kubectl create secret docker-registry regcred \
+    --docker-server=https://index.docker.io/v1/ \
+    --docker-username="$DOCKERHUB_USER" \
+    --docker-password="$DOCKERHUB_TOKEN" \
+    -n "$ns" --dry-run=client -o yaml | kubectl apply -f -
+done
+```
+
+`read -rsp` keeps the token off the screen and out of your shell history. Use a
+Docker Hub **access token**, never your account password.
+
+The `--dry-run=client -o yaml | kubectl apply -f -` ending is what makes this
+re-runnable. A plain `kubectl create secret` fails with `AlreadyExists` the
+second time, which is exactly when you need it — after rotating a token.
+
+Check all four:
+
+```bash
+kubectl get secrets --all-namespaces --field-selector type=kubernetes.io/dockerconfigjson
+```
+
+The server is `https://index.docker.io/v1/` — the `v1` is not a typo and not a
+version you can bump. It is the fixed key Docker uses for Hub in
+`~/.docker/config.json`, and kubelet looks the credentials up under it.
+
+> On a Mac, do **not** build this Secret from `--from-file=$HOME/.docker/config.json`.
+> Docker Desktop keeps credentials in the macOS keychain and leaves only a
+> `credsStore` line in that file, so you get a Secret containing no password.
 
 ## Start it
 
@@ -82,7 +122,7 @@ only route to their app.
 What does **not** work on Mac or Windows is the obvious-looking one:
 
 ```bash
-curl $(minikube ip):30080        # hangs, then fails
+curl $(minikube ip):30202        # hangs, then fails
 ```
 
 The node lives inside a Docker network your browser cannot route to, so the
