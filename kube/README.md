@@ -26,8 +26,9 @@ docker build -t project-assigner:k8s .
 minikube image load project-assigner:k8s
 minikube image load postgres:16-alpine
 minikube image load redis:7-alpine
+minikube image load busybox:1.36                 # only for pod-test.yaml
 
-minikube image ls | grep -E "project-assigner|postgres|redis"   # all three listed
+minikube image ls | grep -E "project-assigner|postgres|redis|busybox"   # all four listed
 ```
 
 Because the image is loaded by hand and never lives in a registry, every
@@ -132,6 +133,78 @@ Every Pod still says `Running`. Nothing is broken, nothing logs an error, and
 the page simply stops loading. **`kubectl get endpoints` is how you catch it** —
 that is the single most useful debugging habit in this session. Put the
 selector back and it returns.
+
+## Testing it from inside the cluster
+
+`pod-test.yaml` is that same check, written down so you do not have to remember
+it. It runs four checks from inside the Pod network and then stops.
+
+```bash
+kubectl delete pod pod-test --ignore-not-found
+kubectl apply -f pod-test.yaml
+kubectl get pod pod-test
+```
+
+The STATUS column is the verdict:
+
+| STATUS | Meaning |
+|---|---|
+| `Completed` | every check passed |
+| `Error` | at least one failed — read the logs |
+
+```bash
+kubectl logs pod-test
+```
+
+```
+--- can this Pod reach the other Services? ---
+PASS  db      tcp 5432
+PASS  cache   tcp 6379
+--- is the app actually serving? ---
+      /api/health -> {"status":"ok","postgres":true,"redis":true}
+PASS  app can reach postgres
+PASS  app can reach redis
+---
+all checks passed
+```
+
+**Always delete before you apply.** Running `kubectl apply` on a Pod that has
+already finished prints `unchanged` and runs nothing. The Pod you are reading
+the logs of is the old one. This catches everybody once.
+
+This is the loud version of the silent failure above. Break the selector again
+and re-run it:
+
+```bash
+kubectl patch svc project-assigner -p '{"spec":{"selector":{"app":"typo"}}}'
+kubectl delete pod pod-test --ignore-not-found && kubectl apply -f pod-test.yaml
+kubectl logs pod-test
+```
+
+```
+PASS  db      tcp 5432
+PASS  cache   tcp 6379
+      /api/health -> <no response>
+FAIL  app can reach postgres
+FAIL  app can reach redis
+```
+
+Read that carefully: db and cache still **pass**. Only the route through the
+Service fails. That is how you tell "the database is down" apart from "the
+Service is not pointing at anything" — a distinction `kubectl get pods` cannot
+make for you, because every Pod says `Running` in both cases.
+
+Put it back when you are done:
+
+```bash
+kubectl patch svc project-assigner -p '{"spec":{"selector":{"app":"project-assigner"}}}'
+kubectl get endpoints project-assigner    # three IPs again
+```
+
+Why run the checks in a Pod rather than curl from your laptop? Because
+`http://project-assigner` only means anything inside the cluster. A
+port-forward to `localhost:8090` bypasses cluster DNS and the Service IP, so it
+can succeed while the thing your other Pods actually use is broken.
 
 ## Stop it
 
